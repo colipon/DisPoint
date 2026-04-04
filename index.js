@@ -1,264 +1,206 @@
-const { Client, MessageFlags, GatewayIntentBits, EmbedBuilder, REST, Routes, SlashCommandBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Collection, EmbedBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const fs = require('fs');
-const fetch = require('node-fetch');
-const readline = require('readline');
+const { db, recordPlayTime, save } = require('./modules/database');
+const fetch = globalThis.fetch;
 require('dotenv').config();
 
-// --- 設定エリア ---
-const TOKEN = process.env.TOKEN;
-const CLIENT_ID = process.env.CLIENT_ID;
-const DATA_FILE = './points_data.json';
-const MASTER_ID = process.env.MASTER_ID;
-const LEVEL_UP_STEP = Number(process.env.LVLUP_STEP) || 10;
-// ----------------
-
-let targetChannelId = null;
-
-const client = new Client({ 
+const client = new Client({
     intents: [
         GatewayIntentBits.Guilds, 
         GatewayIntentBits.GuildMessages, 
-        GatewayIntentBits.MessageContent 
-    ] 
+        GatewayIntentBits.MessageContent, 
+        GatewayIntentBits.GuildMembers,
+        GatewayIntentBits.DirectMessages
+    ]
 });
 
-// ターミナル用
-const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: '> '
-});
+// --- 🛠️ 設定 ---
+const MASTER_ID = process.env.MASTER_ID;
+const LOG_CHANNEL_ID = process.env.LOG_CHANNEL_ID;
 
-// ログ出力用
-function logToConsole(message) {
-    readline.cursorTo(process.stdout, 0);
-    process.stdout.write(message + '\n');
-    rl.prompt(true);
+client.commands = new Collection();
+const commandFiles = fs.readdirSync('./modules/commands').filter(f => f.endsWith('.js'));
+for (const file of commandFiles) {
+    const command = require(`./modules/commands/${file}`);
+    client.commands.set(command.data.name, command);
 }
 
-// 画面初期化
-function initscreen() {
-    console.clear(); 
-    logToConsole("========================================");
-    logToConsole("      Discord Bot Control Panel");
-    logToConsole("========================================");
-    logToConsole(`Token:      ${TOKEN ? '✅ Loaded' : '❌ Missing'}`);
-    logToConsole(`Client ID:  ${CLIENT_ID}`);
-    logToConsole(`Master ID:  ${MASTER_ID}`);
-    logToConsole(`LVL UP Pt:  ${LEVEL_UP_STEP}`);
-    logToConsole("----------------------------------------");
-}
-
-// データ管理
-let db = { users: {}, lastMessageId: null, admins: [MASTER_ID] };
-if (fs.existsSync(DATA_FILE)) {
+// --- ログ送信関数 ---
+const sendLog = async (content) => {
     try {
-        db = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8'));
-    } catch (e) { logToConsole("⚠️ データ読み込み失敗"); }
-}
-const save = () => fs.writeFileSync(DATA_FILE, JSON.stringify(db, null, 2));
+        const channel = await client.channels.fetch(LOG_CHANNEL_ID);
+        if (channel) await channel.send(content);
+    } catch (e) { console.error("ログ送信エラー:", e); }
+};
 
-// ターミナルでのコマンド処理
-rl.on('line', async (line) => {
-    const args = line.trim().split(' ');
-    const command = args[0];
+// --- 🕵️ EarthMC 監視ロジック ---
+setInterval(async () => {
+    const userMap = {};
+    const mcids = Object.entries(db.users).map(([id, data]) => {
+        if (data.mcid) { userMap[data.mcid.toLowerCase()] = id; return data.mcid; }
+    }).filter(Boolean);
+    if (mcids.length === 0) return;
+    try {
+        const res = await fetch(`https://api.earthmc.net/v3/aurora/players`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ query: mcids })
+        });
+        const players = await res.json();
+    } catch (e) { console.error("監視エラー:", e); }
+}, 5 * 60 * 1000);
 
-    switch (command) {
-        case '/ch':
-            if (args[1]) {
-                targetChannelId = args[1];
-                logToConsole(`ターゲットチャンネルを [${targetChannelId}] に設定しました。`);
-            } else {
-                logToConsole("❌ 使用法: /ch <チャンネルID>");
-            }
-            break;
+client.once('clientReady', () => console.log(`🚀 EURM Online: Monitoring ${Object.keys(db.users).length} users.`));
 
-        case '/list':
-            logToConsole("\n--- 現在のランキング ---");
-            const sorted = Object.entries(db.users).sort(([,a], [,b]) => b.points - a.points).slice(0, 10);
-            sorted.forEach(([id, d], i) => {
-                logToConsole(`${i+1}. ID:${id} | ${d.mcid || '未連携'} | ${d.points}pt (LV.${d.level})`);
-            });
-            logToConsole("---------------------------\n");
-            break;
+// --- 👑 !master コマンド (GUIパネル & コマンド対応) ---
+client.on('messageCreate', async message => {
+    if (message.author.bot || message.author.id !== MASTER_ID) return;
+
+    // --- !clear (チャンネルの全メッセージ削除) ---
+    if (message.content === '!clear') {
+        const confirmEmbed = new EmbedBuilder()
+            .setTitle("⚠️ ログ全削除の確認")
+            .setDescription("このチャンネルのメッセージをすべて（最大100件）削除しますか？")
+            .setColor(0xFF0000);
+
+        const row = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('confirm_clear_all').setLabel('実行する').setStyle(ButtonStyle.Danger),
+            new ButtonBuilder().setCustomId('cancel_clear').setLabel('キャンセル').setStyle(ButtonStyle.Secondary)
+        );
+
+        return message.reply({ embeds: [confirmEmbed], components: [row] });
+    }
+
+    // --- !mclear (マスターコマンド系の掃除) ---
+    if (message.content === '!mclear') {
+        const messages = await message.channel.messages.fetch({ limit: 100 });
         
-        case '/clear':
-            initscreen();
-            break;
+        // !masterから始まるメッセージ、またはBot自身のメッセージ（返信など）を抽出
+        const targets = messages.filter(m => 
+            m.content.startsWith('!master') || 
+            m.content.startsWith('!mclear') ||
+            m.author.id === client.user.id
+        );
 
-        case '/exit':
-            logToConsole("Exiting...");
-            process.exit(0);
-            break;
+        if (targets.size > 0) {
+            await message.channel.bulkDelete(targets, true);
+            const notice = await message.channel.send(`🧹 マスター関連のログを ${targets.size} 件掃除したよ！`);
+            setTimeout(() => notice.delete().catch(() => {}), 3000); // 3秒後に通知も消す
+        } else {
+            const notice = await message.reply("掃除する対象が見つからなかったよ。");
+            setTimeout(() => notice.delete().catch(() => {}), 3000);
+        }
+    }
 
-        default:
-            if (targetChannelId) {
-                const channel = await client.channels.fetch(targetChannelId).catch(() => null);
-                if (channel) {
-                    channel.send(line);
-                    logToConsole(`✉️ Discordへ送信: ${line}`);
-                } else {
-                    logToConsole("❌ チャンネルが見つかりません。");
-                }
-            } else {
-                logToConsole("⚠️ /ch <ID> で送信先を指定してください。");
+    if (message.content.startsWith('!master')) {
+        const args = message.content.split(/\s+/);
+        const sub = args[1]; 
+        let targetId = message.mentions.users.first()?.id || (args[2] && /^\d+$/.test(args[2]) ? args[2] : null);
+
+        if (!sub || sub === 'help') {
+            return message.reply("👑 **Master Commands**\n`!master status <@user/ID>` - GUI管理パネル表示\n`!master list` - 登録者数確認");
+        }
+
+        if (sub === 'list') return message.reply(`📊 登録ユーザー数: ${Object.keys(db.users).length}名`);
+
+        if (!targetId) return message.reply("❌ ユーザーをメンションするか、IDを入力してください。");
+
+        // GUIパネルの表示
+        if (sub === 'status') {
+            try {
+                const target = await client.users.fetch(targetId);
+                const data = db.users[target.id] || { history: {} };
+
+                const embed = new EmbedBuilder()
+                    .setTitle(`⚙️ 管理パネル: ${target.tag}`)
+                    .setDescription(`Discord ID: \`${target.id}\`\nMCID: \`${data.mcid || '未連携'}\``)
+                    .setThumbnail(target.displayAvatarURL())
+                    .addFields(
+                        { name: '🚫 BAN状態', value: data.isBanned ? '✅ **BAN中**' : '❌ 正常', inline: true },
+                        { name: '👑 管理者権限', value: data.isMaster ? '✅ **あり**' : '❌ なし', inline: true }
+                    )
+                    .setColor(data.isBanned ? 0xFF0000 : (data.isMaster ? 0xFFD700 : 0x00AE86));
+
+                const row = new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setCustomId(`gui_ban_${target.id}`).setLabel(data.isBanned ? '🔓 BAN解除' : '🚫 BANする').setStyle(data.isBanned ? ButtonStyle.Success : ButtonStyle.Danger),
+                    new ButtonBuilder().setCustomId(`gui_master_${target.id}`).setLabel(data.isMaster ? '🎖️ 権限剥奪' : '👑 権限付与').setStyle(ButtonStyle.Primary),
+                    new ButtonBuilder().setCustomId(`gui_delete_${target.id}`).setLabel('🗑️ データ削除').setStyle(ButtonStyle.Secondary)
+                );
+
+                return message.reply({ embeds: [embed], components: [row] });
+            } catch (e) {
+                return message.reply("❌ ユーザーが見つかりません。IDが正しいか確認してください。");
             }
-            break;
+        }
     }
-    rl.prompt();
 });
 
-// ユーザーデータの初期化
-function initUser(userId) {
-    if (!db.users[userId]) {
-        db.users[userId] = { points: 0, level: 1, weeklyPoints: 0, mcid: null };
+// --- 🔘 ボタン & スラッシュコマンド処理 ---
+client.on('interactionCreate', async i => {
+    // ボタン処理
+    if (i.isButton() && i.customId.startsWith('gui_')) {
+        if (i.user.id !== MASTER_ID) return i.reply({ content: "❌ 権限がありません。", ephemeral: true });
+        const [_, type, targetId] = i.customId.split('_');
+        if (!db.users[targetId]) db.users[targetId] = { history: {} };
+
+        let actionLog = "";
+        if (type === 'ban') {
+            db.users[targetId].isBanned = !db.users[targetId].isBanned;
+            actionLog = `BAN: **${db.users[targetId].isBanned ? 'ON' : 'OFF'}**`;
+        } else if (type === 'master') {
+            db.users[targetId].isMaster = !db.users[targetId].isMaster;
+            actionLog = `権限: **${db.users[targetId].isMaster ? 'ON' : 'OFF'}**`;
+        } else if (type === 'delete') {
+            delete db.users[targetId];
+            actionLog = `**全データ削除**`;
+        }
+        save();
+        await i.update({ content: `✅ <@${targetId}> に対し実行: ${actionLog}`, embeds: [], components: [] });
+        await sendLog(`🛠️ **GUI Admin Action**\n実行者: <@${i.user.id}>\n対象: <@${targetId}>\n内容: ${actionLog}`);
+        return;
     }
-}
 
-// ポイント更新処理
-function updateUserData(userId, messageId, amount = 1) {
-    initUser(userId);
-    db.users[userId].points += amount;
-    db.users[userId].weeklyPoints = (db.users[userId].weeklyPoints || 0) + amount;
-    db.users[userId].level = Math.max(1, Math.floor(db.users[userId].points / LEVEL_UP_STEP) + 1);
-    if (messageId) db.lastMessageId = messageId;
-}
+    // スラッシュコマンド処理
+    if (!i.isChatInputCommand()) return;
+    if (db.users[i.user.id]?.isBanned) return i.reply({ content: "❌ あなたはボットの使用を禁止されています。", ephemeral: true });
 
-// MCIDの実在チェック
-async function getMcProfile(mcid) {
-    try {
-        const res = await fetch(`https://api.mojang.com/users/profiles/minecraft/${mcid}`);
-        if (res.status === 200) return await res.json();
-        return null;
-    } catch (e) { return null; }
-}
+    const cmd = client.commands.get(i.commandName);
+    if (!cmd) return;
 
-// MCIDの重複チェック
-function getOwnerOfMcid(mcid) {
-    const entry = Object.entries(db.users).find(([id, data]) => data.mcid && data.mcid.toLowerCase() === mcid.toLowerCase());
-    return entry ? entry[0] : null;
-}
-
-// --- コマンド登録 (REST) ---
-const commands = [
-    new SlashCommandBuilder().setName('pt').setDescription('ポイントシステム')
-        .addSubcommand(sub => sub.setName('list').setDescription('ランキングを表示'))
-        .addSubcommand(sub => sub.setName('mclink').setDescription('MCIDと連携').addStringOption(o => o.setName('mcid').setRequired(true).setDescription('MCID')))
-        .addSubcommand(sub => sub.setName('mchange').setDescription('MCIDを変更').addStringOption(o => o.setName('mcid').setRequired(true).setDescription('新しいMCID')))
-        .addSubcommand(sub => sub.setName('mforce').setDescription('【マスター】MCID強制設定').addUserOption(o => o.setName('user').setRequired(true).setDescription('対象')).addStringOption(o => o.setName('mcid').setRequired(true).setDescription('MCID')))
-        .addSubcommand(sub => sub.setName('set').setDescription('ポイント加減算').addUserOption(o => o.setName('user').setRequired(true).setDescription('対象')).addIntegerOption(o => o.setName('amount').setRequired(true).setDescription('追加する値')))
-        .addSubcommand(sub => sub.setName('weekly_reset').setDescription('週間リセット'))
-        .addSubcommand(sub => sub.setName('admin_add').setDescription('管理者追加').addUserOption(o => o.setName('user').setRequired(true).setDescription('対象')))
-        .addSubcommand(sub => sub.setName('admin_remove').setDescription('管理者削除').addUserOption(o => o.setName('user').setRequired(true).setDescription('対象')))
-        .addSubcommand(sub => sub.setName('clear').setDescription('全データ初期化'))
-].map(c => c.toJSON());
-
-const rest = new REST({ version: '10' }).setToken(TOKEN);
-(async () => {
-    try { await rest.put(Routes.applicationCommands(CLIENT_ID), { body: commands }); } catch (e) { console.error(e); }
-})();
-
-// 起動処理
-client.once('clientReady', async () => {
-    logToConsole(`${client.user.tag} has Launched!`);
-    rl.prompt();
-});
-
-// リアルタイム監視
-client.on('messageCreate', (msg) => {
-    if (msg.author.bot) return;
-    updateUserData(msg.author.id, msg.id, 1);
-    save();
-});
-
-// コマンド処理（ログ出力追加）
-client.on('interactionCreate', async interaction => {
-    if (!interaction.isChatInputCommand() || interaction.commandName !== 'pt') return;
-
-    const sub = interaction.options.getSubcommand();
-    const user = interaction.user;
-    
-    // ターミナルに実行ログを流す
-    logToConsole(`${user.username}@${user.id} > /pt ${sub}`);
+    // --- 📝 フルコマンドログ作成 ---
+    const getOpts = (options) => {
+        return options.map(o => {
+            if (o.type === 1) return `${o.name} ${getOpts(o.options || [])}`; // Subcommand
+            return `${o.name}:${o.value}`;
+        }).join(' ');
+    };
+    const fullCommand = `/${i.commandName} ${getOpts(i.options.data)}`.trim();
+    await sendLog(`📝 **Command Log**\n実行者: \`${i.user.tag}\` (ID: ${i.user.id})\nコマンド: \`${fullCommand}\``);
 
     try {
-        const userId = user.id;
-        const isMaster = (userId === MASTER_ID);
-        const isAdmin = db.admins.includes(userId) || isMaster;
-
-        if (sub === 'list') {
-            const sorted = Object.entries(db.users).sort(([,a], [,b]) => b.points - a.points).slice(0, 10);
-            const listLines = await Promise.all(sorted.map(async ([id, d], i) => {
-                const member = await interaction.guild.members.fetch(id).catch(() => null);
-                const name = member ? member.user.username : 'Unknown';
-                const weekly = d.weeklyPoints || 0;
-                return `${i+1}. **@${name}**${d.mcid ? ` [${d.mcid}]` : ''} | LV.${d.level} (${d.points}pt) | 週間:${weekly}pt`;
-            }));
-            const embed = new EmbedBuilder().setTitle('🏆 ポイントランキング').setDescription(listLines.join('\n') || 'データなし').setColor(0x2f3136);
-            return interaction.reply({ embeds: [embed] });
-        }
-
-        if (sub === 'mclink' || sub === 'mchange') {
-            const mcid = interaction.options.getString('mcid');
-            await interaction.deferReply({ flags: [MessageFlags.Ephemeral] });
-            const existingOwner = getOwnerOfMcid(mcid);
-            if (existingOwner && existingOwner !== userId) return interaction.editReply(`❌ 使用中のIDです。`);
-            const profile = await getMcProfile(mcid);
-            if (!profile) return interaction.editReply('❌ 実在しません。');
-            initUser(userId);
-            db.users[userId].mcid = profile.name;
-            save();
-            return interaction.editReply(`✅ \`${profile.name}\` と連携しました！`);
-        }
-
-        if (sub === 'mforce') {
-            if (!isMaster) return interaction.reply({ content: '❌ 権限なし', flags: [MessageFlags.Ephemeral] });
-            const target = interaction.options.getUser('user');
-            const mcid = interaction.options.getString('mcid');
-            const profile = await getMcProfile(mcid);
-            if (!profile) return interaction.reply('❌ 実在しません。');
-            initUser(target.id);
-            db.users[target.id].mcid = profile.name;
-            save();
-            return interaction.reply(`🛡️ ${target.username} を \`${profile.name}\` に設定しました。`);
-        }
-
-        if (sub === 'set') {
-            if (!isAdmin) return interaction.reply({ content: '❌ 権限なし', flags: [MessageFlags.Ephemeral] });
-            const target = interaction.options.getUser('user');
-            const amount = interaction.options.getInteger('amount');
-            updateUserData(target.id, null, amount);
-            save();
-            return interaction.reply(`✅ ${target.username} : ${db.users[target.id].points}pt`);
-        }
-
-        if (sub === 'weekly_reset') {
-            if (!isAdmin) return interaction.reply({ content: '❌ 権限なし', flags: [MessageFlags.Ephemeral] });
-            Object.values(db.users).forEach(u => u.weeklyPoints = 0);
-            save();
-            return interaction.reply('週間リセット完了。');
-        }
-
-        if (sub === 'admin_add' || sub === 'admin_remove') {
-            if (!isMaster) return interaction.reply({ content: '❌ 権限なし', flags: [MessageFlags.Ephemeral] });
-            const target = interaction.options.getUser('user');
-            if (sub === 'admin_add') { if (!db.admins.includes(target.id)) db.admins.push(target.id); }
-            else { if (target.id !== MASTER_ID) db.admins = db.admins.filter(id => id !== target.id); }
-            save();
-            return interaction.reply(`管理者更新。`);
-        }
-
-        if (sub === 'clear') {
-            if (!isAdmin) return interaction.reply({ content: '❌ 権限なし', flags: [MessageFlags.Ephemeral] });
-            db.users = {}; save();
-            return interaction.reply('データ初期化。');
-        }
-
+        await cmd.execute(i);
     } catch (error) {
-        logToConsole(`⚠️ Error: ${error.message}`);
-        if (!interaction.replied) interaction.reply({ content: 'エラーが発生しました: ', flags: [MessageFlags.Ephemeral] });
+        console.error(error);
+        if (!i.replied && !i.deferred) await i.reply({ content: 'エラー。', ephemeral: true });
     }
 });
 
-client.login(TOKEN);
-initscreen();
+process.on('uncaughtException', async (err) => {
+    console.error('致命的なエラー:', err);
+    await sendLog(`🔥 **[FATAL ERROR] 未処理の例外**\n\`\`\`js\n${err.stack || err}\n\`\`\``);
+    // 致命的な場合はプロセスを落とすか検討が必要だけど、ひとまず通知
+});
+
+// 未処理のプロミス拒否 (Async)
+process.on('unhandledRejection', async (reason, promise) => {
+    console.error('未処理の拒否:', reason);
+    await sendLog(`⚠️ **[UNHANDLED REJECTION] 非同期エラー**\n\`\`\`js\n${reason.stack || reason}\n\`\`\``);
+});
+
+// Discord.js Clientのエラー
+client.on('error', async (error) => {
+    console.error('Discordクライアントエラー:', error);
+    await sendLog(`📡 **[CLIENT ERROR]**\n\`\`\`js\n${error.stack || error}\n\`\`\``);
+});
+
+client.login(process.env.TOKEN);
